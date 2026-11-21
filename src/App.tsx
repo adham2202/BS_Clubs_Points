@@ -50,6 +50,22 @@ import {
   type BrandingConfig,
 } from './state/branding';
 import {
+  clearPendingTimestamps,
+  fetchCloudSnapshot,
+  loadPendingSync,
+  mergeServerSnapshot,
+  pushCloudWrite,
+  setPendingTimestamp,
+  type PendingScopeKey,
+} from './state/cloudSync';
+import {
+  buildAllClubRecords,
+  CLUB_IDS,
+  extractClubRecord,
+  type CloudSnapshot,
+  type CloudWriteRequest,
+} from './state/cloudTypes';
+import {
   loadDriveSources,
   resetDriveSources,
   saveDriveSources,
@@ -143,6 +159,29 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
+function computeClubSig(
+  clubId: ClubId,
+  st: AppState,
+  pr: AllClubPresets,
+  ds: ClubDriveSources,
+): string {
+  return JSON.stringify({
+    c: st.committees.filter((x) => x.clubId === clubId),
+    m: st.members.filter((x) => x.clubId === clubId),
+    h: st.history.filter((x) => x.clubId === clubId),
+    p: pr[clubId],
+    d: ds[clubId],
+  });
+}
+
+function computeConfigSig(
+  br: BrandingConfig,
+  pc: ClubPasscodes,
+  mg: ClubManagers,
+): string {
+  return JSON.stringify({ br, pc, mg });
+}
+
 export function App() {
   const [state, dispatch] = useReducer(trackerReducer, undefined, loadState);
   const [branding, setBranding] = useState<BrandingConfig>(loadBranding);
@@ -185,13 +224,285 @@ export function App() {
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [driveSyncModalClub, setDriveSyncModalClub] = useState<ClubId | null>(null);
   const [scrollCommitteeId, setScrollCommitteeId] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'saving' | 'error'>('idle');
 
   const importInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  const cloudEnabledRef = useRef(false);
+  const inFlightWritesRef = useRef(0);
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const latestDataRef = useRef({
+    state,
+    branding,
+    passcodes,
+    managers,
+    presets,
+    driveSources,
+  });
+  latestDataRef.current = {
+    state,
+    branding,
+    passcodes,
+    managers,
+    presets,
+    driveSources,
+  };
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  const prevClubSigsRef = useRef<Record<ClubId, string>>({
+    chemistry: computeClubSig('chemistry', state, presets, driveSources),
+    physics: computeClubSig('physics', state, presets, driveSources),
+    mathematics: computeClubSig('mathematics', state, presets, driveSources),
+    biology: computeClubSig('biology', state, presets, driveSources),
+  });
+  const prevConfigSigRef = useRef<string>(
+    computeConfigSig(branding, passcodes, managers),
+  );
+
+  const enqueueCloudWrite = useCallback(
+    (payload: CloudWriteRequest, clearedScopes: PendingScopeKey[]) => {
+      inFlightWritesRef.current += 1;
+      setSyncStatus('saving');
+      writeQueueRef.current = writeQueueRef.current.then(async () => {
+        const ok = await pushCloudWrite(payload);
+        inFlightWritesRef.current = Math.max(0, inFlightWritesRef.current - 1);
+        if (ok) {
+          clearPendingTimestamps(clearedScopes);
+          if (inFlightWritesRef.current === 0) {
+            setSyncStatus('idle');
+          }
+        } else {
+          setSyncStatus('error');
+        }
+      });
+    },
+    [],
+  );
+
+  const applyAndReconcileSnapshot = useCallback(
+    (snapshot: CloudSnapshot) => {
+      cloudEnabledRef.current = true;
+      const cur = latestDataRef.current;
+      const pending = loadPendingSync();
+      const merged = mergeServerSnapshot({
+        localState: cur.state,
+        localBranding: cur.branding,
+        localPasscodes: cur.passcodes,
+        localManagers: cur.managers,
+        localPresets: cur.presets,
+        localDriveSources: cur.driveSources,
+        pending,
+        snapshot,
+      });
+
+      for (const clubId of CLUB_IDS) {
+        prevClubSigsRef.current[clubId] = computeClubSig(
+          clubId,
+          merged.mergedState,
+          merged.mergedPresets,
+          merged.mergedDriveSources,
+        );
+      }
+      prevConfigSigRef.current = computeConfigSig(
+        merged.mergedBranding,
+        merged.mergedPasscodes,
+        merged.mergedManagers,
+      );
+
+      saveState(merged.mergedState);
+      saveBranding(merged.mergedBranding);
+      savePasscodes(merged.mergedPasscodes);
+      saveManagers(merged.mergedManagers);
+      savePresets(merged.mergedPresets);
+      saveDriveSources(merged.mergedDriveSources);
+
+      dispatch({ type: 'RESTORE_SNAPSHOT', snapshot: merged.mergedState });
+      setBranding(merged.mergedBranding);
+      setPasscodes(merged.mergedPasscodes);
+      setManagers(merged.mergedManagers);
+      setPresets(merged.mergedPresets);
+      setDriveSources(merged.mergedDriveSources);
+
+      const curSession = sessionRef.current;
+      if (
+        curSession &&
+        !isManagerAuthorized(
+          curSession.scope,
+          curSession.officerName,
+          merged.mergedManagers,
+        ).allowed
+      ) {
+        clearSession();
+        setSession(null);
+      }
+
+      if (merged.scopesToPush.includes('all')) {
+        const now = Date.now();
+        enqueueCloudWrite(
+          {
+            scope: 'all',
+            clubs: buildAllClubRecords(
+              merged.mergedState,
+              merged.mergedPresets,
+              merged.mergedDriveSources,
+              now,
+            ),
+            config: {
+              branding: merged.mergedBranding,
+              passcodes: merged.mergedPasscodes,
+              managers: merged.mergedManagers,
+              updatedAt: now,
+            },
+          },
+          ['config', 'club:chemistry', 'club:physics', 'club:mathematics', 'club:biology'],
+        );
+      } else {
+        for (const scopeKey of merged.scopesToPush) {
+          if (scopeKey === 'all') continue;
+          if (scopeKey === 'config') {
+            enqueueCloudWrite(
+              {
+                scope: 'config',
+                record: {
+                  branding: merged.mergedBranding,
+                  passcodes: merged.mergedPasscodes,
+                  managers: merged.mergedManagers,
+                  updatedAt: pending.config ?? Date.now(),
+                },
+              },
+              ['config'],
+            );
+          } else {
+            const clubId = scopeKey.slice(5) as ClubId;
+            enqueueCloudWrite(
+              {
+                scope: 'club',
+                clubId,
+                record: extractClubRecord(
+                  clubId,
+                  merged.mergedState,
+                  merged.mergedPresets,
+                  merged.mergedDriveSources,
+                  pending[scopeKey] ?? Date.now(),
+                ),
+              },
+              [scopeKey],
+            );
+          }
+        }
+      }
+    },
+    [enqueueCloudWrite],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const syncFromCloud = async () => {
+      const snapshot = await fetchCloudSnapshot();
+      if (!snapshot || cancelled) return;
+      applyAndReconcileSnapshot(snapshot);
+    };
+    void syncFromCloud();
+
+    const handleVisibility = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        inFlightWritesRef.current === 0
+      ) {
+        void syncFromCloud();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [applyAndReconcileSnapshot]);
+
   useEffect(() => {
     saveState(state);
-  }, [state]);
+    const changedClubs: ClubId[] = [];
+    for (const clubId of CLUB_IDS) {
+      const nextSig = computeClubSig(clubId, state, presets, driveSources);
+      if (nextSig !== prevClubSigsRef.current[clubId]) {
+        prevClubSigsRef.current[clubId] = nextSig;
+        changedClubs.push(clubId);
+      }
+    }
+    if (changedClubs.length === 0) return;
+
+    const now = Date.now();
+    for (const clubId of changedClubs) {
+      setPendingTimestamp(`club:${clubId}`, now);
+    }
+    if (!cloudEnabledRef.current) return;
+
+    if (changedClubs.length === 1) {
+      const clubId = changedClubs[0];
+      enqueueCloudWrite(
+        {
+          scope: 'club',
+          clubId,
+          record: extractClubRecord(clubId, state, presets, driveSources, now),
+        },
+        [`club:${clubId}`],
+      );
+    } else {
+      enqueueCloudWrite(
+        {
+          scope: 'all',
+          clubs: buildAllClubRecords(state, presets, driveSources, now),
+          config: {
+            branding: latestDataRef.current.branding,
+            passcodes: latestDataRef.current.passcodes,
+            managers: latestDataRef.current.managers,
+            updatedAt: now,
+          },
+        },
+        ['config', 'club:chemistry', 'club:physics', 'club:mathematics', 'club:biology'],
+      );
+    }
+  }, [state, presets, driveSources, enqueueCloudWrite]);
+
+  useEffect(() => {
+    const nextSig = computeConfigSig(branding, passcodes, managers);
+    if (nextSig === prevConfigSigRef.current) return;
+    prevConfigSigRef.current = nextSig;
+
+    const now = Date.now();
+    setPendingTimestamp('config', now);
+    if (!cloudEnabledRef.current) return;
+
+    enqueueCloudWrite(
+      {
+        scope: 'config',
+        record: { branding, passcodes, managers, updatedAt: now },
+      },
+      ['config'],
+    );
+  }, [branding, passcodes, managers, enqueueCloudWrite]);
+
+  const handleRetrySync = useCallback(() => {
+    const cur = latestDataRef.current;
+    const now = Date.now();
+    setPendingTimestamp('config', now);
+    for (const id of CLUB_IDS) setPendingTimestamp(`club:${id}`, now);
+    enqueueCloudWrite(
+      {
+        scope: 'all',
+        clubs: buildAllClubRecords(cur.state, cur.presets, cur.driveSources, now),
+        config: {
+          branding: cur.branding,
+          passcodes: cur.passcodes,
+          managers: cur.managers,
+          updatedAt: now,
+        },
+      },
+      ['config', 'club:chemistry', 'club:physics', 'club:mathematics', 'club:biology'],
+    );
+  }, [enqueueCloudWrite]);
 
   useEffect(() => {
     if (!toast) return;
@@ -687,6 +998,8 @@ export function App() {
         onExportCommitteeCsv={handleExportCommitteeCsv}
         onExportJson={handleExportJson}
         onImportJsonClick={() => importInputRef.current?.click()}
+        syncStatus={syncStatus}
+        onRetrySync={handleRetrySync}
         onResetSample={() =>
           setConfirmDialog({
             title: lockedClub

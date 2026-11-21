@@ -37,6 +37,8 @@ interface HeaderProps {
   onImportJsonClick: () => void;
   onResetSample: () => void;
   onClearAll: () => void;
+  syncStatus?: 'idle' | 'saving' | 'error';
+  onRetrySync?: () => void;
 }
 
 export function Header({
@@ -57,6 +59,8 @@ export function Header({
   onImportJsonClick,
   onResetSample,
   onClearAll,
+  syncStatus = 'idle',
+  onRetrySync,
 }: HeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -148,6 +152,20 @@ export function Header({
         </nav>
 
         <div className="header-actions">
+          {syncStatus === 'saving' && (
+            <span className="sync-status-tag" role="status" aria-live="polite">
+              Saving…
+            </span>
+          )}
+          {syncStatus === 'error' && onRetrySync && (
+            <button
+              type="button"
+              className="btn btn-sm sync-retry-btn"
+              onClick={onRetrySync}
+            >
+              Retry sync
+            </button>
+          )}
           <div className="menu-wrapper" ref={menuRef}>
             <button
               type="button"
