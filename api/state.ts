@@ -1,19 +1,114 @@
 import { BlobNotFoundError, get, put } from '@vercel/blob';
-import {
-  CLUB_IDS,
-  isValidCloudWriteRequest,
-  isValidClubRecord,
-  isValidPortalConfigRecord,
-  type CloudSnapshot,
-  type ClubRecord,
-  type PortalConfigRecord,
-} from '../src/state/cloudTypes';
-import type { ClubId } from '../src/types/tracker';
+
+type ClubId = 'chemistry' | 'physics' | 'mathematics' | 'biology';
+
+const CLUB_IDS: readonly ClubId[] = [
+  'chemistry',
+  'physics',
+  'mathematics',
+  'biology',
+] as const;
+
+interface StoredClubRecord {
+  clubId: ClubId;
+  committees: unknown[];
+  members: unknown[];
+  history: unknown[];
+  presets: { points: unknown[]; reasons: unknown[] };
+  driveSource: { url: string; lastSyncedAt?: string | null };
+  updatedAt: number;
+}
+
+interface StoredConfigRecord {
+  branding: Record<string, unknown>;
+  passcodes: Record<string, unknown>;
+  managers: Record<string, unknown>;
+  updatedAt: number;
+}
+
+type StoredWriteRequest =
+  | { scope: 'club'; clubId: ClubId; record: StoredClubRecord }
+  | { scope: 'config'; record: StoredConfigRecord }
+  | {
+      scope: 'all';
+      clubs: Record<ClubId, StoredClubRecord>;
+      config: StoredConfigRecord;
+    };
 
 const DB_CONFIG_PATH = 'db/portal-config.json';
 
 function clubBlobPath(clubId: ClubId): string {
   return `db/club-${clubId}.json`;
+}
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
+}
+
+function isValidClubId(val: unknown): val is ClubId {
+  return (
+    val === 'chemistry' ||
+    val === 'physics' ||
+    val === 'mathematics' ||
+    val === 'biology'
+  );
+}
+
+function isValidClubRecord(val: unknown): val is StoredClubRecord {
+  if (!isPlainObject(val)) return false;
+  if (!isValidClubId(val.clubId)) return false;
+  if (
+    !Array.isArray(val.committees) ||
+    !Array.isArray(val.members) ||
+    !Array.isArray(val.history)
+  ) {
+    return false;
+  }
+  if (!isPlainObject(val.presets)) return false;
+  if (!Array.isArray(val.presets.points) || !Array.isArray(val.presets.reasons)) {
+    return false;
+  }
+  if (!isPlainObject(val.driveSource) || typeof val.driveSource.url !== 'string') {
+    return false;
+  }
+  return typeof val.updatedAt === 'number' && Number.isFinite(val.updatedAt);
+}
+
+function isValidPortalConfigRecord(val: unknown): val is StoredConfigRecord {
+  if (!isPlainObject(val)) return false;
+  if (
+    !isPlainObject(val.branding) ||
+    !isPlainObject(val.passcodes) ||
+    !isPlainObject(val.managers)
+  ) {
+    return false;
+  }
+  return typeof val.updatedAt === 'number' && Number.isFinite(val.updatedAt);
+}
+
+function isValidCloudWriteRequest(body: unknown): body is StoredWriteRequest {
+  if (!isPlainObject(body)) return false;
+  if (body.scope === 'club') {
+    return (
+      isValidClubId(body.clubId) &&
+      isValidClubRecord(body.record) &&
+      body.record.clubId === body.clubId
+    );
+  }
+  if (body.scope === 'config') {
+    return isValidPortalConfigRecord(body.record);
+  }
+  if (body.scope === 'all') {
+    const clubsObj = body.clubs;
+    if (!isPlainObject(clubsObj) || !isValidPortalConfigRecord(body.config)) {
+      return false;
+    }
+    return CLUB_IDS.every((clubId) => {
+      const rec = clubsObj[clubId];
+      return isValidClubRecord(rec) && rec.clubId === clubId;
+    });
+  }
+  return false;
 }
 
 function isBlobConfigured(): boolean {
@@ -51,10 +146,7 @@ async function readPrivateJson<T>(
     if (err instanceof BlobNotFoundError) {
       return null;
     }
-    if (
-      err instanceof Error &&
-      /not\s*found|404/i.test(err.message)
-    ) {
+    if (err instanceof Error && /not\s*found|404/i.test(err.message)) {
       return null;
     }
     throw err;
@@ -80,16 +172,19 @@ export async function GET(): Promise<Response> {
 
   try {
     const [config, ...clubRecords] = await Promise.all([
-      readPrivateJson<PortalConfigRecord>(
+      readPrivateJson<StoredConfigRecord>(
         DB_CONFIG_PATH,
         isValidPortalConfigRecord,
       ),
       ...CLUB_IDS.map((clubId) =>
-        readPrivateJson<ClubRecord>(clubBlobPath(clubId), isValidClubRecord),
+        readPrivateJson<StoredClubRecord>(
+          clubBlobPath(clubId),
+          isValidClubRecord,
+        ),
       ),
     ]);
 
-    const clubs: Partial<Record<ClubId, ClubRecord>> = {};
+    const clubs: Partial<Record<ClubId, StoredClubRecord>> = {};
     CLUB_IDS.forEach((clubId, index) => {
       const rec = clubRecords[index];
       if (rec) {
@@ -97,14 +192,12 @@ export async function GET(): Promise<Response> {
       }
     });
 
-    const snapshot: CloudSnapshot = {
+    return jsonResponse(200, {
       configured: true,
       initialized: Boolean(config) || Object.keys(clubs).length > 0,
       clubs,
       config,
-    };
-
-    return jsonResponse(200, snapshot);
+    });
   } catch (err) {
     console.error('[api/state] GET failed', err);
     return jsonResponse(500, {
